@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: medirecord
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  django:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/medirecord
+      - REDIS_URL=redis://redis:6379/0
+
+  celery:
+    build: .
+    command: celery -A mediServe worker --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/medirecord
+      - REDIS_URL=redis://redis:6379/0
+
+  celery-beat:
+    build: .
+    command: celery -A mediServe beat --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/medirecord
+      - REDIS_URL=redis://redis:6379/0
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - WEBHOOK_URL=http://localhost:5678
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Installer les dépendances système
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-fra \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copier et installer les dépendances Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copier le code
+COPY . .
+
+# Exposer le port
+EXPOSE 8000
+
+# Commande par défaut
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "mediServe.wsgi:application"]
+
+# Makefile - Commandes pratiques
+.PHONY: setup start stop install-frontend clean
+
+setup:
+	@echo "🚀 Configuration complète de MediRecord..."
+	./setup.sh
+
+start:
+	@echo "▶️ Démarrage des services..."
+	./start_services.sh
+
+stop:
+	@echo "⏹️ Arrêt des services..."
+	./stop_services.sh
+
+install-frontend:
+	@echo "🎨 Installation du frontend..."
+	./install_frontend.sh
+
+clean:
+	@echo "🧹 Nettoyage..."
+	rm -rf pids/
+	sudo docker stop n8n-medirecord 2>/dev/null || true
+	sudo docker rm n8n-medirecord 2>/dev/null || true
+
+migrate:
+	@echo "🗄️ Migrations de la base de données..."
+	source venv/bin/activate && python manage.py migrate
+
+test:
+	@echo "🧪 Tests..."
+	source venv/bin/activate && python manage.py test
+
+deploy:
+	@echo "🚀 Déploiement..."
+	git pull origin main
+	source venv/bin/activate && pip install -r requirements.txt
+	source venv/bin/activate && python manage.py migrate
+	source venv/bin/activate && python manage.py collectstatic --noinput
+	sudo systemctl restart gunicorn
+	sudo systemctl restart nginx
